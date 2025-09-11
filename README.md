@@ -1,77 +1,174 @@
 # Cross-Chain Swap Optimization Hook
 
-A Uniswap v4 hook that finds the best swap execution across multiple chains by comparing prices, gas costs, and bridge fees.
+This is the  implementation of a cross-chain swap optimization system that finds the best execution venue across multiple blockchains.
 
-## Overview
+## Project Structure
 
-This hook analyzes swap opportunities across different blockchains and routes to the venue offering the best net execution price. Instead of just swapping locally, it considers:
+```
+src/
+├── CrossChainSwapHook.sol          # Main contract
+├── interfaces/
+│   ├── IPythOracle.sol            # Pyth oracle interface
+│   └── IBridgeProtocol.sol        # Bridge protocol interface
+└── libraries/
+    ├── PriceCalculator.sol        # Price calculation utilities
+    └── VenueComparator.sol        # Venue comparison logic
+```
 
-- Price differences across chains
-- Gas costs and bridge fees  
-- Execution time
-- Liquidity availability
-
-## How It Works
-
-1. User initiates a swap on Uniswap v4
-2. Hook queries all configured venues (chains/DEXs)
-3. Calculates net output after costs for each venue
-4. Routes to the venue with the best net result
-5. If remote chain is better, bridges tokens and executes there
-
-## Contract Structure
+## Contracts Overview
 
 ### CrossChainSwapHook.sol
-Main hook contract that implements the Uniswap v4 interface.
 
-Key functions:
-- `executeSwap()` - Main swap execution function
-- `simulateSwap()` - Get quotes without executing
-- `addVenue()` - Add new execution venues
+The main contract that handles cross-chain swap optimization. It inherits from OpenZeppelin's `Ownable`, `ReentrancyGuard`, and `Pausable`.
+
+**Key State Variables:**
+- `pythOracle`: IPythOracle instance for price feeds
+- `bridgeProtocol`: IBridgeProtocol instance for cross-chain operations
+- `venues[]`: Array of configured execution venues
+- `tokenPriceData[]`: Mapping of tokens to their price feed configurations
+- `maxSlippageBps`: Maximum allowed slippage (default: 300 = 3%)
+- `protocolFeeBps`: Protocol fee in basis points (default: 10 = 0.1%)
+
+**Main Functions:**
+- `executeSwap(SwapRequest memory request)`: Executes the swap optimization
+- `simulateSwap(SwapRequest memory request)`: Returns quotes without executing
+- `addVenue(uint256 chainId, address venueAddress, string memory name, uint256 gasEstimate)`: Adds new execution venue
+- `configurePriceData(address token, bytes32 priceId, uint256 maxStaleness)`: Configures token price feeds
+
+**Structs:**
+```solidity
+struct SwapRequest {
+    address tokenIn;
+    address tokenOut;
+    uint256 amountIn;
+    uint256 minAmountOut;
+    address recipient;
+    uint256 deadline;
+    bytes32 tokenInPriceId;
+    bytes32 tokenOutPriceId;
+    uint256 maxGasPrice;
+    bool forceLocal;
+}
+
+struct SwapVenue {
+    uint256 chainId;
+    address venueAddress;
+    string name;
+    bool isActive;
+    uint256 baseGasEstimate;
+    uint256 lastUpdateTime;
+    uint8 reliabilityScore;
+}
+
+struct ExecutionQuote {
+    uint256 outputAmount;
+    uint256 totalCost;
+    uint256 netOutput;
+    uint256 venueIndex;
+    uint256 executionTime;
+    bool requiresBridge;
+    bytes bridgeData;
+    uint8 confidenceScore;
+}
+```
+
+### IPythOracle.sol
+
+Interface for Pyth Network price oracles.
+
+**Key Functions:**
+- `getPrice(bytes32 id)`: Returns current price for a price ID
+- `updatePriceFeeds(bytes[] calldata updateData)`: Updates price feeds
+- `getUpdateFee(bytes[] calldata updateData)`: Gets required fee for updates
+
+**Structs:**
+```solidity
+struct Price {
+    int64 price;
+    uint64 conf;
+    int32 expo;
+    uint publishTime;
+}
+```
+
+### IBridgeProtocol.sol
+
+Interface for cross-chain bridge protocols.
+
+**Key Functions:**
+- `getQuote(address tokenIn, address tokenOut, uint256 amountIn, uint256 destinationChainId)`: Gets bridge quote
+- `bridge(address tokenIn, uint256 amountIn, uint256 destinationChainId, address recipient, bytes calldata bridgeData)`: Executes bridge
+
+**Structs:**
+```solidity
+struct BridgeQuote {
+    uint256 outputAmount;
+    uint256 bridgeFee;
+    uint256 estimatedTime;
+    bytes bridgeData;
+    uint256 destinationChainId;
+    uint256 minAmount;
+    uint256 maxAmount;
+    uint256 validUntil;
+}
+```
 
 ### PriceCalculator.sol
-Library for price calculations using Pyth oracles.
 
-- `calculateOutputAmount()` - Convert oracle prices to output amounts
-- `applySlippage()` - Apply slippage protection
-- `calculatePriceImpact()` - Calculate price impact
+Library for price calculations using Pyth oracle data.
+
+**Key Functions:**
+- `calculateOutputAmount(Price memory priceIn, Price memory priceOut, uint256 amountIn)`: Calculates output amount
+- `calculateOutputAmountWithConfidence(...)`: Calculates with confidence scoring
+- `applySlippage(uint256 outputAmount, uint256 slippageBps)`: Applies slippage protection
+- `calculatePriceImpact(uint256 basePrice, uint256 tradeSize, uint256 liquidityDepth)`: Calculates price impact
+
+**Constants:**
+- `MAX_PRICE_STALENESS = 600`: Maximum price staleness (10 minutes)
+- `MIN_CONFIDENCE_SCORE = 20`: Minimum confidence score
+- `PRICE_PRECISION = 1e18`: Price precision for calculations
 
 ### VenueComparator.sol
-Library for ranking and comparing execution venues.
 
-- `calculateVenueScore()` - Score venues 0-100
-- `compareVenues()` - Compare two venues
-- `rankVenues()` - Rank all venues by score
+Library for comparing and ranking execution venues.
 
-### Interfaces
+**Key Functions:**
+- `calculateVenueScore(ComparisonData memory data, ScoringWeights memory weights, ComparisonData memory referenceData)`: Calculates venue score
+- `compareVenues(ComparisonData memory venue1, ComparisonData memory venue2, ScoringWeights memory weights, ComparisonData memory referenceData)`: Compares two venues
+- `rankVenues(ComparisonData[] memory venues, ScoringWeights memory weights, ComparisonData memory referenceData)`: Ranks all venues
 
-- `IPythOracle.sol` - Pyth Network price oracle interface
-- `IBridgeProtocol.sol` - Cross-chain bridge interface
+**Scoring Weights:**
+```solidity
+struct ScoringWeights {
+    uint8 outputWeight;        // 35% - Net output amount
+    uint8 costWeight;          // 20% - Execution costs
+    uint8 timeWeight;          // 15% - Execution speed
+    uint8 reliabilityWeight;   // 10% - Venue reliability
+    uint8 confidenceWeight;    // 10% - Price confidence
+    uint8 liquidityWeight;     // 5% - Available liquidity
+    uint8 performanceWeight;   // 5% - Historical performance
+}
+```
 
-## Usage
-
-### Basic Setup
+## Usage Example
 
 ```solidity
-// Deploy the hook
+// Deploy the contract
 CrossChainSwapHook hook = new CrossChainSwapHook(
-    pythOracle,
-    bridgeProtocol, 
-    feeRecipient
+    pythOracleAddress,
+    bridgeProtocolAddress,
+    feeRecipientAddress
 );
 
-// Add venues
-hook.addVenue(137, polygonVenue, "Polygon", 200000);
-hook.addVenue(42161, arbitrumVenue, "Arbitrum", 150000);
+// Add execution venues
+hook.addVenue(137, polygonVenueAddress, "Polygon Uniswap", 200000);
+hook.addVenue(42161, arbitrumVenueAddress, "Arbitrum Uniswap", 150000);
 
 // Configure price feeds
 hook.configurePriceData(WETH, ETH_PRICE_ID, 600);
 hook.configurePriceData(USDC, USDC_PRICE_ID, 300);
-```
 
-### Executing Swaps
-
-```solidity
+// Execute swap
 SwapRequest memory request = SwapRequest({
     tokenIn: WETH,
     tokenOut: USDC,
@@ -88,120 +185,75 @@ SwapRequest memory request = SwapRequest({
 bytes32 swapId = hook.executeSwap(request);
 ```
 
-## Configuration
-
-### Slippage Settings
-- `maxSlippageBps`: 300 (3% max slippage)
-- `bridgeSlippageBps`: 100 (1% additional for bridges)
-- `minBridgeAmount`: 100e18 (minimum amount to bridge)
-
-### Fee Configuration
-- `protocolFeeBps`: 10 (0.1% protocol fee)
-- `maxGasCostBps`: 500 (max 5% of swap value in gas)
-
-### Venue Scoring
-Venues are scored based on:
-- 35% - Net output amount
-- 20% - Execution costs
-- 15% - Execution speed
-- 10% - Venue reliability
-- 10% - Price confidence
-- 5% - Available liquidity
-- 5% - Historical performance
-
-## Security
-
-### Price Protection
-- Multiple price feed validation
-- Confidence interval checking
-- Staleness protection
-- TWAP support
-
-### Bridge Security
-- Quote validation before execution
-- Slippage protection
-- Timeout enforcement
-- Refund mechanisms for failed bridges
-
-### Access Control
-- Owner-only configuration functions
-- Emergency pause functionality
-- Emergency withdraw for stuck tokens
-
 ## Events
 
-```solidity
-event CrossChainSwapExecuted(
-    address indexed user,
-    address indexed tokenIn,
-    address indexed tokenOut,
-    uint256 amountIn,
-    uint256 amountOut,
-    uint256 destinationChainId,
-    address venue,
-    uint256 bridgeFee,
-    bytes32 swapId
-);
+The contract emits several events for monitoring:
 
-event LocalSwapOptimized(
-    address indexed user,
-    address indexed tokenIn,
-    address indexed tokenOut,
-    uint256 amountIn,
-    uint256 expectedOut,
-    bytes32 swapId
-);
-```
+- `CrossChainSwapExecuted`: When a cross-chain swap is executed
+- `LocalSwapOptimized`: When local execution is chosen
+- `VenueConfigured`: When venues are added or updated
+- `PriceOracleUpdated`: When oracle is changed
+- `BridgeProtocolUpdated`: When bridge protocol is changed
+- `SwapParametersUpdated`: When parameters are updated
+- `EmergencyWithdraw`: When emergency withdrawal occurs
+
+## Admin Functions
+
+Owner-only functions for configuration:
+
+- `addVenue()`: Add new execution venue
+- `updateVenueStatus()`: Enable/disable venues
+- `configurePriceData()`: Configure token price feeds
+- `updatePythOracle()`: Change oracle address
+- `updateBridgeProtocol()`: Change bridge protocol
+- `updateSwapParameters()`: Update slippage and limits
+- `updateFeeParameters()`: Update fee settings
+- `pause()`/`unpause()`: Emergency pause functionality
+- `emergencyWithdraw()`: Recover stuck tokens
+
+## Security Features
+
+- **ReentrancyGuard**: Prevents reentrancy attacks
+- **Pausable**: Emergency pause functionality
+- **Ownable2Step**: Two-step ownership transfer
+- **Slippage Protection**: Configurable slippage limits
+- **Price Validation**: Staleness and confidence checks
+- **Bridge Validation**: Quote validation before execution
 
 ## Development
 
-### Testing
+### Setup
 ```bash
+# Install dependencies
+forge install
+
+# Build contracts
+forge build
+
+# Run tests
 forge test
-forge test -vvv  # verbose output
+
+# Run tests with verbose output
+forge test -vvv
 ```
 
-### Building
-```bash
-forge build
-```
+### Testing
+The project includes basic tests in `test/Counter.t.sol`. Additional tests should be added for the main contract functionality.
 
 ### Deployment
 ```bash
+# Deploy to testnet
 forge script script/Counter.s.sol --rpc-url <RPC_URL> --broadcast
+
+# Verify on block explorer
+forge verify-contract <CONTRACT_ADDRESS> src/CrossChainSwapHook.sol:CrossChainSwapHook --chain-id <CHAIN_ID>
 ```
 
-## Integration
+## Dependencies
 
-### Frontend Integration
-```javascript
-// Get quote
-const [bestQuote, allQuotes] = await hook.simulateSwap(swapRequest);
-
-// Execute swap
-const hookData = ethers.AbiCoder.defaultAbiCoder().encode(
-    ["tuple(address,address,uint256,uint256,address,uint256,bytes32,bytes32,uint256,bool)"], 
-    [swapRequest]
-);
-await poolManager.swap(poolKey, swapParams, hookData);
-```
-
-### Bridge Protocol Integration
-Implement the `IBridgeProtocol` interface:
-
-```solidity
-contract YourBridge is IBridgeProtocol {
-    function getQuote(address tokenIn, address tokenOut, uint256 amountIn, uint256 destinationChainId) 
-        external view returns (BridgeQuote memory) {
-        // Return accurate quote
-    }
-    
-    function bridge(address tokenIn, uint256 amountIn, uint256 destinationChainId, address recipient, bytes calldata bridgeData) 
-        external payable returns (bytes32 transactionId) {
-        // Execute bridge
-    }
-}
-```
+- OpenZeppelin Contracts v5.4.0
+- Foundry (forge, cast, anvil)
+- Solidity ^0.8.24
 
 ## License
 
