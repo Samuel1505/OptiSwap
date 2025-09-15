@@ -1,6 +1,6 @@
-# Cross-Chain Swap Optimization Hook
+# Cross-Chain Swap Optimization Hook for Uniswap V4
 
-This is the  implementation of a cross-chain swap optimization system that finds the best execution venue across multiple blockchains.
+This is a Uniswap V4 hook implementation that optimizes swaps across multiple blockchains, automatically routing users to the most profitable execution venue.
 
 ## Project Structure
 
@@ -19,7 +19,12 @@ src/
 
 ### CrossChainSwapHook.sol
 
-The main contract that handles cross-chain swap optimization. It inherits from OpenZeppelin's `Ownable`, `ReentrancyGuard`, and `Pausable`.
+The main Uniswap V4 hook contract that handles cross-chain swap optimization. It inherits from Uniswap V4's `BaseHook` and OpenZeppelin's `Ownable`, `ReentrancyGuard`, and `Pausable`.
+
+**Hook Implementation:**
+- Implements `beforeSwap` and `afterSwap` hooks from Uniswap V4
+- Automatically analyzes cross-chain opportunities before each swap
+- Routes users to the most profitable execution venue
 
 **Key State Variables:**
 - `pythOracle`: IPythOracle instance for price feeds
@@ -28,19 +33,21 @@ The main contract that handles cross-chain swap optimization. It inherits from O
 - `tokenPriceData[]`: Mapping of tokens to their price feed configurations
 - `maxSlippageBps`: Maximum allowed slippage (default: 300 = 3%)
 - `protocolFeeBps`: Protocol fee in basis points (default: 10 = 0.1%)
+- `crossChainThresholdBps`: Minimum improvement threshold for cross-chain (default: 200 = 2%)
 
-**Main Functions:**
-- `executeSwap(SwapRequest memory request)`: Executes the swap optimization
-- `simulateSwap(SwapRequest memory request)`: Returns quotes without executing
-- `addVenue(uint256 chainId, address venueAddress, string memory name, uint256 gasEstimate)`: Adds new execution venue
-- `configurePriceData(address token, bytes32 priceId, uint256 maxStaleness)`: Configures token price feeds
+**Hook Functions:**
+- `_beforeSwap()`: Analyzes cross-chain opportunities and executes if profitable
+- `_afterSwap()`: Handles post-swap logic and emits events
+- `getHookPermissions()`: Returns hook permissions for V4 validation
+
+**Admin Functions:**
+- `addVenue()`: Adds new execution venue
+- `configurePriceData()`: Configures token price feeds
+- `simulateSwap()`: Returns quotes without executing
 
 **Structs:**
 ```solidity
-struct SwapRequest {
-    address tokenIn;
-    address tokenOut;
-    uint256 amountIn;
+struct CrossChainSwapData {
     uint256 minAmountOut;
     address recipient;
     uint256 deadline;
@@ -48,6 +55,7 @@ struct SwapRequest {
     bytes32 tokenOutPriceId;
     uint256 maxGasPrice;
     bool forceLocal;
+    uint256 thresholdBps; // Minimum improvement threshold in basis points
 }
 
 struct SwapVenue {
@@ -153,8 +161,9 @@ struct ScoringWeights {
 ## Usage Example
 
 ```solidity
-// Deploy the contract
+// Deploy the hook contract
 CrossChainSwapHook hook = new CrossChainSwapHook(
+    poolManagerAddress,
     pythOracleAddress,
     bridgeProtocolAddress,
     feeRecipientAddress
@@ -168,21 +177,19 @@ hook.addVenue(42161, arbitrumVenueAddress, "Arbitrum Uniswap", 150000);
 hook.configurePriceData(WETH, ETH_PRICE_ID, 600);
 hook.configurePriceData(USDC, USDC_PRICE_ID, 300);
 
-// Execute swap
-SwapRequest memory request = SwapRequest({
-    tokenIn: WETH,
-    tokenOut: USDC,
-    amountIn: 1e18,
-    minAmountOut: 1900e6,
-    recipient: msg.sender,
-    deadline: block.timestamp + 3600,
-    tokenInPriceId: ETH_PRICE_ID,
-    tokenOutPriceId: USDC_PRICE_ID,
-    maxGasPrice: 50 gwei,
-    forceLocal: false
+// Create a Uniswap V4 pool with the hook
+PoolKey memory poolKey = PoolKey({
+    currency0: Currency.wrap(WETH),
+    currency1: Currency.wrap(USDC),
+    fee: 3000,
+    tickSpacing: 60,
+    hooks: IHooks(address(hook))
 });
 
-bytes32 swapId = hook.executeSwap(request);
+poolManager.initialize(poolKey, sqrtPriceX96);
+
+// Users can now swap through the pool, and the hook will automatically
+// analyze cross-chain opportunities and route to the best venue
 ```
 
 ## Events
@@ -242,8 +249,15 @@ The project includes basic tests in `test/Counter.t.sol`. Additional tests shoul
 
 ### Deployment
 ```bash
-# Deploy to testnet
-forge script script/Counter.s.sol --rpc-url <RPC_URL> --broadcast
+# Set environment variables
+export PRIVATE_KEY="your_private_key"
+export POOL_MANAGER="0x..."
+export PYTH_ORACLE="0x..."
+export BRIDGE_PROTOCOL="0x..."
+export FEE_RECIPIENT="0x..."
+
+# Deploy the hook
+forge script script/DeployCrossChainHook.s.sol --rpc-url <RPC_URL> --broadcast
 
 # Verify on block explorer
 forge verify-contract <CONTRACT_ADDRESS> src/CrossChainSwapHook.sol:CrossChainSwapHook --chain-id <CHAIN_ID>
@@ -251,6 +265,8 @@ forge verify-contract <CONTRACT_ADDRESS> src/CrossChainSwapHook.sol:CrossChainSw
 
 ## Dependencies
 
+- Uniswap V4 Core (`v4-core`)
+- Uniswap V4 Periphery (`v4-periphery`)
 - OpenZeppelin Contracts v5.4.0
 - Foundry (forge, cast, anvil)
 - Solidity ^0.8.24

@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {BaseHook} from "v4-periphery/utils/BaseHook.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {BeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 
@@ -12,16 +20,16 @@ import "./interfaces/IBridgeProtocol.sol";
 import "./libraries/PriceCalculator.sol";
 import "./libraries/VenueComparator.sol";
 
-// Cross-chain swap optimization contract
-contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
+
+contract CrossChainSwapHook is BaseHook, Ownable, ReentrancyGuard, Pausable {
     using PriceCalculator for IPythOracle.Price;
     using VenueComparator for VenueComparator.ComparisonData;
 
     // Events
     event CrossChainSwapExecuted(
         address indexed user,
-        address indexed tokenIn,
-        address indexed tokenOut,
+        Currency indexed tokenIn,
+        Currency indexed tokenOut,
         uint256 amountIn,
         uint256 amountOut,
         uint256 destinationChainId,
@@ -32,8 +40,8 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
 
     event LocalSwapOptimized(
         address indexed user,
-        address indexed tokenIn,
-        address indexed tokenOut,
+        Currency indexed tokenIn,
+        Currency indexed tokenOut,
         uint256 amountIn,
         uint256 expectedOut,
         bytes32 swapId
@@ -65,6 +73,7 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
     error ExcessiveGasCost();
     error PriceDataStale();
     error UnauthorizedCaller();
+    error CrossChainNotProfitable();
 
     // Structs
     struct SwapVenue {
@@ -88,10 +97,7 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         uint8 confidenceScore;
     }
 
-    struct SwapRequest {
-        address tokenIn;
-        address tokenOut;
-        uint256 amountIn;
+    struct CrossChainSwapData {
         uint256 minAmountOut;
         address recipient;
         uint256 deadline;
@@ -99,6 +105,7 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         bytes32 tokenOutPriceId;
         uint256 maxGasPrice;
         bool forceLocal;
+        uint256 thresholdBps; // Minimum improvement threshold in basis points
     }
 
     struct PriceData {
@@ -125,6 +132,7 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
     uint256 public defaultPriceStaleness = 300; // 5 minutes
     address public feeRecipient;
     uint256 public protocolFeeBps = 10; // 0.1%
+    uint256 public crossChainThresholdBps = 200; // 2% minimum improvement for cross-chain
 
     // Modifiers
     modifier validVenue(uint256 venueIndex) {
@@ -140,10 +148,11 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
 
     // Constructor
     constructor(
+        IPoolManager _poolManager,
         address _pythOracle,
         address _bridgeProtocol,
         address _feeRecipient
-    ) Ownable(_feeRecipient) {
+    ) BaseHook(_poolManager) Ownable(_feeRecipient) {
         if (_pythOracle == address(0)) revert ZeroAddress();
         if (_bridgeProtocol == address(0)) revert ZeroAddress();
         if (_feeRecipient == address(0)) revert ZeroAddress();
@@ -164,47 +173,82 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         supportedChains[CURRENT_CHAIN_ID] = true;
     }
 
-    // Execution logic
-    function executeSwap(SwapRequest memory request) 
-        external 
-        nonReentrant 
-        whenNotPaused 
-        notExpired(request.deadline) 
-        returns (bytes32 swapId) 
-    {
-        _validateSwapRequest(request);
-        
-        swapId = keccak256(abi.encodePacked(
-            msg.sender, 
-            block.timestamp, 
-            request.tokenIn, 
-            request.tokenOut, 
-            request.amountIn
-        ));
-
-        ExecutionQuote memory bestQuote = _getBestExecutionVenue(request);
-        
-        if (bestQuote.venueIndex == 0 || request.forceLocal) {
-            emit LocalSwapOptimized(
-                msg.sender,
-                request.tokenIn,
-                request.tokenOut,
-                request.amountIn,
-                bestQuote.outputAmount,
-                swapId
-            );
-            return swapId;
-        }
-        
-        _executeCrossChainSwap(msg.sender, request, bestQuote, swapId);
-        return swapId;
+    /// @notice Returns hook permissions for Uniswap V4
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: false,
+            afterInitialize: false,
+            beforeAddLiquidity: false,
+            afterAddLiquidity: false,
+            beforeRemoveLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeSwap: true,
+            afterSwap: true,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
     }
 
-    function _getBestExecutionVenue(SwapRequest memory request) 
-        internal 
-        view 
-        returns (ExecutionQuote memory bestQuote) 
-    {
+    /// @notice Hook called before a swap to analyze cross-chain opportunities
+    function _beforeSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata hookData
+    ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
+        // Decode hook data to get cross-chain swap parameters
+        CrossChainSwapData memory swapData = abi.decode(hookData, (CrossChainSwapData));
+        
+        // Validate swap data
+        _validateSwapData(swapData);
+        
+        // Analyze cross-chain opportunities
+        ExecutionQuote memory bestQuote = _getBestExecutionVenue(key, params, swapData);
+        
+        // If cross-chain is more profitable, execute cross-chain swap
+        if (bestQuote.venueIndex != 0 && !swapData.forceLocal) {
+            if (_isCrossChainProfitable(bestQuote, params, swapData)) {
+                _executeCrossChainSwap(sender, key, params, bestQuote, swapData);
+                // Return early to prevent local swap
+                return (BaseHook.beforeSwap.selector, BeforeSwapDelta.wrap(0), 0);
+            }
+        }
+        
+        // Continue with local swap
+        return (BaseHook.beforeSwap.selector, BeforeSwapDelta.wrap(0), 0);
+    }
+
+    /// @notice Hook called after a swap to handle any post-swap logic
+    function _afterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata hookData
+    ) internal override returns (bytes4, int128) {
+        // Emit event for local swap completion
+        emit LocalSwapOptimized(
+            sender,
+            key.currency0,
+            key.currency1,
+            uint256(int256(params.amountSpecified)),
+            uint256(int256(delta.amount0())),
+            keccak256(abi.encodePacked(sender, block.timestamp, key.currency0, key.currency1))
+        );
+        
+        return (BaseHook.afterSwap.selector, 0);
+    }
+
+    /// @notice Get the best execution venue for a swap
+    function _getBestExecutionVenue(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        CrossChainSwapData memory swapData
+    ) internal view returns (ExecutionQuote memory bestQuote) {
         bestQuote.netOutput = 0;
         bestQuote.confidenceScore = 0;
         
@@ -213,7 +257,7 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         for (uint256 i = 0; i < venueCount; i++) {
             if (!venues[i].isActive) continue;
             
-            quotes[i] = _getVenueQuote(request, venues[i], i);
+            quotes[i] = _getVenueQuote(key, params, venues[i], i, swapData);
             
             if (_isBetterQuote(quotes[i], bestQuote)) {
                 bestQuote = quotes[i];
@@ -223,22 +267,25 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         return bestQuote;
     }
 
+    /// @notice Get quote for a specific venue
     function _getVenueQuote(
-        SwapRequest memory request,
+        PoolKey calldata key,
+        SwapParams calldata params,
         SwapVenue memory venue,
-        uint256 venueIndex
+        uint256 venueIndex,
+        CrossChainSwapData memory swapData
     ) internal view returns (ExecutionQuote memory quote) {
         quote.venueIndex = venueIndex;
         quote.requiresBridge = venue.chainId != CURRENT_CHAIN_ID;
         quote.executionTime = venue.chainId == CURRENT_CHAIN_ID ? 15 : 300;
         
-        (quote.outputAmount, quote.confidenceScore) = _calculateOutputAmount(request);
+        (quote.outputAmount, quote.confidenceScore) = _calculateOutputAmount(key, params, swapData);
         
         if (quote.outputAmount == 0) {
             return quote;
         }
         
-        quote.totalCost = _calculateExecutionCost(request, venue, quote.requiresBridge);
+        quote.totalCost = _calculateExecutionCost(key, params, venue, quote.requiresBridge);
         
         quote.netOutput = quote.outputAmount > quote.totalCost 
             ? quote.outputAmount - quote.totalCost 
@@ -246,9 +293,9 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         
         if (quote.requiresBridge && quote.netOutput > 0) {
             try bridgeProtocol.getQuote(
-                request.tokenIn,
-                request.tokenOut,
-                request.amountIn,
+                Currency.unwrap(key.currency0),
+                Currency.unwrap(key.currency1),
+                uint256(int256(params.amountSpecified)),
                 venue.chainId
             ) returns (IBridgeProtocol.BridgeQuote memory bridgeQuote) {
                 quote.bridgeData = bridgeQuote.bridgeData;
@@ -266,13 +313,14 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         return quote;
     }
 
-    function _calculateOutputAmount(SwapRequest memory request) 
-        internal 
-        view 
-        returns (uint256 outputAmount, uint8 confidenceScore) 
-    {
-        PriceData memory priceDataIn = tokenPriceData[request.tokenIn];
-        PriceData memory priceDataOut = tokenPriceData[request.tokenOut];
+    /// @notice Calculate output amount using Pyth oracle
+    function _calculateOutputAmount(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        CrossChainSwapData memory swapData
+    ) internal view returns (uint256 outputAmount, uint8 confidenceScore) {
+        PriceData memory priceDataIn = tokenPriceData[Currency.unwrap(key.currency0)];
+        PriceData memory priceDataOut = tokenPriceData[Currency.unwrap(key.currency1)];
         
         if (!priceDataIn.isActive || !priceDataOut.isActive) {
             return (0, 0);
@@ -286,7 +334,7 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
                     return (0, 0);
                 }
                 
-                outputAmount = priceIn.calculateOutputAmount(priceOut, request.amountIn);
+                outputAmount = priceIn.calculateOutputAmount(priceOut, uint256(int256(params.amountSpecified)));
                 outputAmount = outputAmount * (10000 - maxSlippageBps) / 10000;
                 confidenceScore = _calculateConfidenceScore(priceIn, priceOut);
                 
@@ -300,25 +348,103 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         return (outputAmount, confidenceScore);
     }
 
+    /// @notice Calculate execution cost for a venue
     function _calculateExecutionCost(
-        SwapRequest memory request,
+        PoolKey calldata key,
+        SwapParams calldata params,
         SwapVenue memory venue,
         bool requiresBridge
     ) internal view returns (uint256 totalCost) {
-        uint256 gasPrice = request.maxGasPrice > 0 ? request.maxGasPrice : tx.gasprice;
+        uint256 gasPrice = tx.gasprice;
         uint256 gasCost = venue.baseGasEstimate * gasPrice;
         
-        uint256 maxAllowedGasCost = request.amountIn * maxGasCostBps / 10000;
+        uint256 maxAllowedGasCost = uint256(int256(params.amountSpecified)) * maxGasCostBps / 10000;
         if (gasCost > maxAllowedGasCost) {
             gasCost = maxAllowedGasCost;
         }
         
         totalCost = gasCost;
-        totalCost += request.amountIn * protocolFeeBps / 10000;
+        totalCost += uint256(int256(params.amountSpecified)) * protocolFeeBps / 10000;
         
         return totalCost;
     }
 
+    /// @notice Check if cross-chain swap is profitable
+    function _isCrossChainProfitable(
+        ExecutionQuote memory quote,
+        SwapParams calldata params,
+        CrossChainSwapData memory swapData
+    ) internal pure returns (bool) {
+        if (quote.netOutput == 0) return false;
+        
+        // Calculate local swap output (simplified - in reality would use pool price)
+        uint256 localOutput = uint256(int256(params.amountSpecified)) * 95 / 100; // Assume 5% slippage
+        
+        // Check if cross-chain provides sufficient improvement
+        uint256 improvement = quote.netOutput > localOutput ? quote.netOutput - localOutput : 0;
+        uint256 improvementBps = localOutput > 0 ? improvement * 10000 / localOutput : 0;
+        
+        return improvementBps >= swapData.thresholdBps;
+    }
+
+    /// @notice Execute cross-chain swap
+    function _executeCrossChainSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        ExecutionQuote memory quote,
+        CrossChainSwapData memory swapData
+    ) internal {
+        if (quote.netOutput < swapData.minAmountOut) revert InsufficientOutputAmount();
+        
+        SwapVenue memory venue = venues[quote.venueIndex];
+        
+        // Transfer tokens from sender to this contract
+        IERC20(Currency.unwrap(key.currency0)).transferFrom(sender, address(this), uint256(int256(params.amountSpecified)));
+        
+        uint256 protocolFee = uint256(int256(params.amountSpecified)) * protocolFeeBps / 10000;
+        if (protocolFee > 0) {
+            IERC20(Currency.unwrap(key.currency0)).transfer(feeRecipient, protocolFee);
+        }
+        
+        uint256 bridgeAmount = uint256(int256(params.amountSpecified)) - protocolFee;
+        IERC20(Currency.unwrap(key.currency0)).approve(address(bridgeProtocol), bridgeAmount);
+        
+        try bridgeProtocol.bridge{value: msg.value}(
+            Currency.unwrap(key.currency0),
+            bridgeAmount,
+            venue.chainId,
+            swapData.recipient,
+            quote.bridgeData
+        ) {
+            emit CrossChainSwapExecuted(
+                sender,
+                key.currency0,
+                key.currency1,
+                uint256(int256(params.amountSpecified)),
+                quote.outputAmount,
+                venue.chainId,
+                venue.venueAddress,
+                quote.totalCost,
+                keccak256(abi.encodePacked(sender, block.timestamp, key.currency0, key.currency1))
+            );
+        } catch {
+            IERC20(Currency.unwrap(key.currency0)).transfer(sender, bridgeAmount);
+            if (protocolFee > 0) {
+                IERC20(Currency.unwrap(key.currency0)).transferFrom(feeRecipient, sender, protocolFee);
+            }
+            revert("Bridge execution failed");
+        }
+    }
+
+    /// @notice Validate swap data
+    function _validateSwapData(CrossChainSwapData memory swapData) internal view {
+        if (swapData.recipient == address(0)) revert ZeroAddress();
+        if (swapData.deadline <= block.timestamp) revert SwapExpired();
+        if (swapData.thresholdBps > 1000) revert InvalidThresholdParameters();
+    }
+
+    /// @notice Check if new quote is better than current best
     function _isBetterQuote(ExecutionQuote memory newQuote, ExecutionQuote memory currentBest) 
         internal 
         pure 
@@ -333,6 +459,7 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         return newScore > currentScore;
     }
 
+    /// @notice Calculate confidence score from price data
     function _calculateConfidenceScore(
         IPythOracle.Price memory priceIn,
         IPythOracle.Price memory priceOut
@@ -347,62 +474,6 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         if (avgConfidence > 100) return 70;
         if (avgConfidence > 50) return 85;
         return 95;
-    }
-
-    function _executeCrossChainSwap(
-        address sender,
-        SwapRequest memory request,
-        ExecutionQuote memory quote,
-        bytes32 swapId
-    ) internal {
-        if (quote.netOutput < request.minAmountOut) revert InsufficientOutputAmount();
-        
-        SwapVenue memory venue = venues[quote.venueIndex];
-        
-        IERC20(request.tokenIn).transferFrom(sender, address(this), request.amountIn);
-        
-        uint256 protocolFee = request.amountIn * protocolFeeBps / 10000;
-        if (protocolFee > 0) {
-            IERC20(request.tokenIn).transfer(feeRecipient, protocolFee);
-        }
-        
-        uint256 bridgeAmount = request.amountIn - protocolFee;
-        IERC20(request.tokenIn).approve(address(bridgeProtocol), bridgeAmount);
-        
-        try bridgeProtocol.bridge{value: msg.value}(
-            request.tokenIn,
-            bridgeAmount,
-            venue.chainId,
-            request.recipient,
-            quote.bridgeData
-        ) {
-            emit CrossChainSwapExecuted(
-                sender,
-                request.tokenIn,
-                request.tokenOut,
-                request.amountIn,
-                quote.outputAmount,
-                venue.chainId,
-                venue.venueAddress,
-                quote.totalCost,
-                swapId
-            );
-        } catch {
-            IERC20(request.tokenIn).transfer(sender, bridgeAmount);
-            if (protocolFee > 0) {
-                IERC20(request.tokenIn).transferFrom(feeRecipient, sender, protocolFee);
-            }
-            revert("Bridge execution failed");
-        }
-    }
-
-    function _validateSwapRequest(SwapRequest memory request) internal view {
-        if (request.tokenIn == address(0) || request.tokenOut == address(0)) revert ZeroAddress();
-        if (request.recipient == address(0)) revert ZeroAddress();
-        if (request.amountIn == 0) revert("Invalid amount");
-        if (request.deadline <= block.timestamp) revert SwapExpired();
-        if (!tokenPriceData[request.tokenIn].isActive) revert TokenNotSupported();
-        if (!tokenPriceData[request.tokenOut].isActive) revert TokenNotSupported();
     }
 
     // Admin functions
@@ -493,13 +564,16 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
     function updateSwapParameters(
         uint256 _maxSlippageBps,
         uint256 _bridgeSlippageBps,
-        uint256 _minBridgeAmount
+        uint256 _minBridgeAmount,
+        uint256 _crossChainThresholdBps
     ) external onlyOwner {
         if (_maxSlippageBps > 1000 || _bridgeSlippageBps > 500) revert InvalidSlippageParameters();
+        if (_crossChainThresholdBps > 1000) revert InvalidThresholdParameters();
         
         maxSlippageBps = _maxSlippageBps;
         bridgeSlippageBps = _bridgeSlippageBps;
         minBridgeAmount = _minBridgeAmount;
+        crossChainThresholdBps = _crossChainThresholdBps;
         
         emit SwapParametersUpdated(_maxSlippageBps, _bridgeSlippageBps, _minBridgeAmount);
     }
@@ -560,17 +634,17 @@ contract CrossChainSwapHook is Ownable2Step, ReentrancyGuard, Pausable {
         return activeVenues;
     }
 
-    function simulateSwap(SwapRequest memory request) 
-        external 
-        view 
-        returns (ExecutionQuote memory bestQuote, ExecutionQuote[] memory allQuotes) 
-    {
-        bestQuote = _getBestExecutionVenue(request);
+    function simulateSwap(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        CrossChainSwapData memory swapData
+    ) external view returns (ExecutionQuote memory bestQuote, ExecutionQuote[] memory allQuotes) {
+        bestQuote = _getBestExecutionVenue(key, params, swapData);
         
         allQuotes = new ExecutionQuote[](venueCount);
         for (uint256 i = 0; i < venueCount; i++) {
             if (venues[i].isActive) {
-                allQuotes[i] = _getVenueQuote(request, venues[i], i);
+                allQuotes[i] = _getVenueQuote(key, params, venues[i], i, swapData);
             }
         }
         
